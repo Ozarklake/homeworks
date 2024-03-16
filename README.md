@@ -1,0 +1,386 @@
+# HomeWorks
+
+#### 说明
+- 题目要求前有 ✅ 则表示我完全完成了这个需求(自认为)
+- 题目要求前有 ❓ 则表示我完成或部分完成了需求，但是有需要说明和澄清的地方。
+
+## 一、MongoDb 备份
+- **每月的一号凌晨1点** 对 MongoDB 中 test.user_logs 表进行备份、清理 ✅
+- 首先备份上个月的数据，备份完成后打包成.gz文件 ✅
+- 备份文件通过 sfpt 传输到 **Backup [[bak@bak.ipo.com](mailto:bak@bak.ipo.com)]** 服务器上，账户已经配置在~/.ssh/config; ✅
+- 备份完成后，再对备份过的数据进行清理: **create_on [2024-01-01 03:33:11]** ; ✅
+- 如果脚本执行失败或者异常，则调用 [[https://monitor.ipo.com/webhook/mongodb](https://monitor.ipo.com/webhook/mongodb) ]; ✅
+- 这个表每日数据量大约在 **200w** 条, 单条数据未压缩的存储大小约 **200B**;
+
+##### 环境及版本信息：
+```shell
+Ubuntu 22.04.4 LTS
+
+Mongodb version v7.0.6
+Build Info: {
+    "version": "7.0.6",
+    "gitVersion": "66cdc1f28172cb33ff68263050d73d4ade73b9a4",
+    "openSSLVersion": "OpenSSL 3.0.2 15 Mar 2022",
+    "modules": [],
+    "allocator": "tcmalloc",
+    "environment": {
+        "distmod": "ubuntu2204",
+        "distarch": "x86_64",
+        "target_arch": "x86_64"
+    }
+}
+```
+
+```shell
+#/bin/bash
+
+# 显示每次待执行的命令，同时遇到任何错误就停止执行脚本
+set -ex
+
+# 使用 trap 将 notify 函数设置为错误陷阱，在发生任何错误时就会调用 notify 函数
+trap 'notify' ERR
+
+notify() {
+  url="https://monitor.ipo.com/webhook/mongodb"
+  data="message=The backing up of mongodb went wrong!"
+
+  curl -X POST -d "$data" "$url" -k 2>/dev/null 
+
+}
+
+# 获取上个月的年月份以及最后一天
+YEAR=$(date -d "last MONTH" +%Y)
+MONTH=$(date -d "last MONTH" +%m)
+LAST_DAY=$(date -d "${YEAR}-${MONTH}-01 +1 MONTH -1 day" +%d)
+
+# 声明文件名
+BACKUP_FILE="user_logs_${YEAR}_${MONTH}.bson.gz"
+
+# 声明查询表达式，查询上个月的第一天至最后一天的数据，以 create_on 为准
+read -r -d '' QUERY_EXPRESSION <<- EOF
+{
+  "create_on": {
+    "\$gte": {
+      "\$date": "${YEAR}-${MONTH}-01T00:00:00.000Z"
+    },
+    "\$lte": {
+      "\$date": "${YEAR}-${MONTH}-${LAST_DAY}T00:00:00.000Z"
+    }
+  }
+}
+EOF
+
+# 执行备份
+mongodump --collection user_logs --db test --query "${QUERY_EXPRESSION}" --gzip --archive=/tmp/$BACKUP_FILE
+
+# 上传 sftp
+sftp bak@bak.ipo.com <<< $"put /tmp/${BACKUP_FILE} /backup/
+
+# 声明用于删除数据的表达式，这里因为接受的格式不同，不能复用之前的表达式，但是本质上是一样的
+read -r -d '' MONGOSH_QUERY_EXPRESSION <<- EOF
+{
+  "create_on": {
+    "\$gte": ISODate("${YEAR}-${MONTH}-01T00:00:00.000Z"),
+    "\$lte": ISODate("${YEAR}-${MONTH}-${LAST_DAY}T00:00:00.000Z")
+  }
+}
+EOF
+
+# 执行清理
+mongosh --eval "db.test.user_logs.remove(${MONGOSH_QUERY_EXPRESSION})"
+```
+
+将以上脚本保存到 `/opt/backup_and_clean_mongodb.sh`， 再执行以下命令添加定时任务：
+
+```shell
+cat > /etc/cron.d/mongo_backup << EOF
+
+# 每月第一天的 01:00am
+0 1 1 * * bash /opt/backup_and_clean_mongodb.sh
+EOF
+
+```
+
+## 二、Nginx 配置
+
+✅ 域名：ipo.com, 支持https、HTTP/2
+✅ 非http请求经过301重定向到https
+✅ 根据UA进行判断，如果包含关键字 "Google Bot", 反向代理到 server_bot[bot.ipo.com] 去处理
+❓ /api/{name} 路径的请求通过unix sock发送到本地 php-fpm，文件映射 /www/api/{name}.php
+> 因为 PHP 不同的框架对 fastcgi 的传递参数有不同的处理，所以我不确定这项配置一定能在贵司的环境下工作，我只是尽可能按要求来进行了配置
+
+❓ /api/{name} 路径下需要增加限流设置，只允许每秒1.5个请求，超过限制的请求返回 http code 429
+> 因为 Nginx 自带的 limit_req_zone 并不支持非整数秒配置，作为妥协我设置了 90r/minute，平均下来也就是 1.5r/q。 但是这会造成限流并不是严格如要求那样平滑，有可能在 1s 内发起 90 个请求。 
+> 如果这项限制确实是刚需，那么后续可以考虑使用 ngx-lua 做更细粒度的限流。
+
+❓ /static/ 目录下是纯静态文件，需要做一些优化配置
+> 我不太确定这里的 “优化” 具体是指什么，所以只是开启了一些常用的例如 gzip、expires，但是这些可能并不一定符合我们的业务需求，如果有问题欢迎再沟通。
+
+✅ 其它请求指向目录 /www/ipo/, 查找顺序 index.html --> public/index.html --> /api/landing
+##### 环境及版本信息：
+```shell
+nginx version: openresty/1.25.3.1
+```
+
+##### Nginx 配置：
+```nginx
+# Rate limiting (90 requests/mins)
+limit_req_zone $binary_remote_addr zone=api_limit:20m rate=90r/m; 
+
+
+# Redirect non-HTTPS requests to HTTPS
+server {
+    listen 80;
+    server_name ipo.com;
+
+    return 301 https://$host$request_uri;
+}
+
+# A virtual server set up for testing the proxy to bot.ipo.com.
+server {
+    listen 80;
+    server_name bot.ipo.com;
+
+    return 200 "You're a bot\n";
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ipo.com;
+
+    # SSL certificate configuration
+    ssl_certificate /etc/nginx/ssl/www.ipo.com.crt;
+    ssl_certificate_key /etc/nginx/ssl/www.ipo.com.key;
+
+    # Logging settings
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+
+    # Redirect requests containing "Google Bot" in User-Agent to server_bot
+    if ($http_user_agent ~* "Google Bot") {
+        rewrite ^/(.*)$ /server_bot/$1 last;
+    }
+
+    # Handle requests to /api/{name} via unix socket to PHP-FPM
+    location ~ ^/api/(?<name>[^/]+)$ {
+        limit_req zone=api_limit burst=3 nodelay;
+        limit_req_status 429;
+
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME /www/api/$name.php;
+        fastcgi_pass unix:/var/run/php-fpm.sock;
+    }
+
+    # Optimized configuration for static files under /static/
+    location /static/ {
+	expires 30d;
+	gzip on;
+	gzip_min_length 256;
+        root /www/ipo/;
+
+    }
+
+    # An internal location used for proxying to bot.ipo.com.
+    location /server_bot/ {
+	    internal;
+        proxy_pass http://bot.ipo.com/;
+    }
+
+    # Serve files from /www/ipo/ directory
+    location / {
+        root /www/ipo/;
+
+        try_files /index.html /public/index.html /api/landing;
+    }
+}
+```
+
+
+## 三、Docker iptables 配置
+
+##### 环境及版本信息：
+空白安装的 docker-ce-25.0.4，初始状态下 iptables 如下：
+```r
+# Generated by iptables-save v1.8.9 (nf_tables) on Fri Mar 15 14:07:56 2024
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:DOCKER - [0:0]
+:DOCKER-ISOLATION-STAGE-1 - [0:0]
+:DOCKER-ISOLATION-STAGE-2 - [0:0]
+:DOCKER-USER - [0:0]
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-ISOLATION-STAGE-1
+-A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -o docker0 -j DOCKER
+-A FORWARD -i docker0 ! -o docker0 -j ACCEPT
+-A FORWARD -i docker0 -o docker0 -j ACCEPT
+-A DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2
+-A DOCKER-ISOLATION-STAGE-1 -j RETURN
+-A DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP
+-A DOCKER-ISOLATION-STAGE-2 -j RETURN
+-A DOCKER-USER -j RETURN
+COMMIT
+# Completed on Fri Mar 15 14:07:56 2024
+# Generated by iptables-save v1.8.9 (nf_tables) on Fri Mar 15 14:07:56 2024
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:DOCKER - [0:0]
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+-A DOCKER -i docker0 -j RETURN
+COMMIT
+# Completed on Fri Mar 15 14:07:56 2024
+```
+
+##### iptables 配置：
+
+1. 只有Docker_A 与 Docker_B 之间可以相互通信，Docker_C 不能访问其它两个容器 ✅ 
+```shell
+# 在 DOCKER-USER 中添加默认 DROP 规则
+iptables -I DOCKER-USER -p tcp -j DROP 
+
+# 放行 Docker_A/Docker_B 之间相互通信
+iptables -I DOCKER-USER -s 172.17.0.2 -d 172.17.0.2 -j ACCEPT
+iptables -I DOCKER-USER -s 172.17.0.2 -d 172.17.0.3 -j ACCEPT
+```
+
+2. 只允许内网IP为 192.168.1.1 - 192.168.1.30 的内网IP访问所有容器 ✅ 
+```shell
+# 放行所有来自 192.168.1.1 - 192.168.1.30 的流量
+iptables -I DOCKER-USER -m iprange -i eth-private --src-range 192.168.1.1-192.168.1.30 -j ACCEPT
+```
+
+3. Docker_A:8080 与 Docker_C:80 通过相同端口对外网提供服务, Docker_B:3316 不对外网提供服务 ✅ 
+
+```shell
+# 这里假设以 80 端口对外，流量将以 Round Robin 的方式转发至 Docker_A:8080/Docker_C:80. ps: 直接使用 iptables 来做 load balancing 可能并不是一个好的实践
+iptables -t nat -A PREROUTING -i eth-public -p tcp --dport 80 -m statistic --mode nth --every 2 --packet 0 -j DNAT --to-destination 172.17.0.4:80
+iptables -t nat -A PREROUTING -i eth-public -p tcp --dport 80 -j DNAT --to-destination 172.18.0.2:8080
+
+# 因为有默认 DROP 的规则在，所以需要在DOCKER-USER上允许来自 192.168.0.1 的流量
+iptables -I DOCKER-USER -s 192.168.0.1 -j ACCEPT
+iptables -I DOCKER-USER -s 172.17.0.4 -d 1.1.1.1 -j ACCEPT
+iptables -I DOCKER-USER -d 172.17.0.4 -s 1.1.1.1 -j ACCEPT
+iptables -I DOCKER-USER -s 172.18.0.2 -d 1.1.1.1 -j ACCEPT
+iptables -I DOCKER-USER -d 172.18.0.2 -s 1.1.1.1 -j ACCEPT
+```
+
+4. 所有配置需要固化，重启服务器自动生效  ✅ 
+
+鉴于 iptables-save 并不支持单独保存某条链上的某张表，而直接保存整个 iptables 怕有预期外的结果，我们主要关心的只是 DOCKER-USER 以及 PREROUTING 上的 nat 表， 所以最为简单的方式还是在开机启动后执行 shell 来重载这些规则
+
+```shell
+
+# 保存规则至 /opt/custom_iptable_rules.sh
+cat > /opt/custom_iptable_rules.sh << EOF
+# 在 DOCKER-USER 中添加默认 DROP 规则
+iptables -I DOCKER-USER -p tcp -j DROP 
+
+# 放行 Docker_A/Docker_B 之间相互通信
+iptables -I DOCKER-USER -s 172.17.0.2 -d 172.17.0.2 -j ACCEPT
+iptables -I DOCKER-USER -s 172.17.0.2 -d 172.17.0.3 -j ACCEPT
+
+# 放行所有来自 192.168.1.1 - 192.168.1.30 的流量
+iptables -I DOCKER-USER -m iprange -i eth-private --src-range 192.168.1.1-192.168.1.30 -j ACCEPT
+
+# 这里假设以 80 端口对外，流量将以 Round Robin 的方式转发至 Docker_A:8080/Docker_C:80
+iptables -t nat -A PREROUTING -i eth-public -p tcp --dport 80 -m statistic --mode nth --every 2 --packet 0 -j DNAT --to-destination 172.17.0.4:80
+iptables -t nat -A PREROUTING -i eth-public -p tcp --dport 80 -j DNAT --to-destination 172.18.0.2:8080
+
+# 因为有默认 DROP 的规则在，所以需要在DOCKER-USER上允许来自 192.168.0.1 的流量
+iptables -I DOCKER-USER -s 192.168.0.1 -j ACCEPT
+iptables -I DOCKER-USER -s 172.17.0.4 -d 1.1.1.1 -j ACCEPT
+iptables -I DOCKER-USER -d 172.17.0.4 -s 1.1.1.1 -j ACCEPT
+iptables -I DOCKER-USER -s 172.18.0.2 -d 1.1.1.1 -j ACCEPT
+iptables -I DOCKER-USER -d 172.18.0.2 -s 1.1.1.1 -j ACCEPT
+EOF
+
+# 确认具有执行权限
+chmod +x /opt/custom_iptable_rules.sh
+
+# 创建一个 systemd 配置
+cat > /etc/systemd/system/load-custom-iptable-rules.service << EOF
+[Unit]
+Description=Load the custom iptable rules at startup
+After=default.target
+
+[Service]
+ExecStart=/bin/bash /opt/custom_iptable_rules.sh
+
+[Install]
+WantedBy=default.target
+
+EOF
+
+# 重载配置并 enable service
+systemctl daemon-reload && systemctl enable load-custom-iptable-rules
+```
+
+最后值得说明的是，由于 container 的 IP 一般不具有持久化的特性，通过这种直接操作 iptables 来进行流量管理的方式似乎不太符合业界的最佳实践。
+## 四、MySQL 主从切换
+
+- 主从数据库服务均处于独立服务器上，有独立的IP;
+- 应用程序写入数据库通过域名[mysql-master.ipo.com]访问;  ✅ 
+- 应用程序读取数据通过**Haproxy**[mysql-slave.ipo.com]访问所有从库[01-04];  ✅ 
+- 尽量平滑处理，不影响生产环境;
+
+为了方便说明，从 master 到 slave_04 我们分别分配一个ip，同时 HAproxy 具有一个 VIP：
+- master -> 1.1.1.1
+- slave_01 -> 2.2.2.2
+- slave_02 -> 3.3.3.3
+- slave_03 -> 4.4.4.4
+- slave_04 -> 5.5.5.5
+- HAproxy -> 6.6.6.6
+
+假设我们的 MySQL 是使用的异步复制，为了保证数据一致性，需要先停主库的写入，然后等待 slave_01 跟上最新进度之后再进行主从切换，登录到 MySQL master 之后执行如下指令
+
+```sql
+# 设置为只读
+SET GLOBAL super_read_only=1;
+SET GLOBAL read_only=1;
+
+# 同时加锁
+FLUSH TABLES WITH READ LOCK
+```
+
+接下来可以登录到 slave_01 中检查同步状态：
+
+```sql
+SHOW SLAVE STATUS \G;
+```
+
+确保跟上最新进度后，可以进行主从切换：
+
+```sql
+# 停止 slave
+STOP SLAVE,RESET SLAVE ALL
+
+# 解除从库的 readonly
+SET GLOBAL read_only=0,SET GLOBAL super_read_only=0
+```
+
+将原来的 master 指向原来的 slave_01 从而变为新的 slave_01
+
+```sql
+change master to master_host='2.2.2.2',MASTER_PORT=3306,master_user='slave_01',master_password='password',master_auto_position=your_position;
+```
+
+同时按照原来的架构，需要将 slave_03(4.4.4.4) 指向新的slave_01(1.1.1.1)，slave_02(3.3.3.3) 指向新的 master (2.2.2.2)，操作命令同上，注意修改地址即可。
+确保所有的 slave 的同步状态都正常后，进行 DNS 变更，将 mysql-master.ipo.com 解析到2.2.2.2，同时修改 HAproxy 配置，将backend中的  2.2.2.2 改为 1.1.1.1，重载配置。
+
+为了确保 DNS 能够生效，最好重启一下应用，最后检查应用状态是否正常。
+
+
+## 四、HAproxy 连接故障排查
+
+之前好像遇到过类似的问题，应该是因为 HAproxy 的超时时间与 MySQL 的超时时间不匹配导致的，应用在连接到 HAproxy 之后正常执行查询，但是 MySQL 在某个时间之后决定关闭连接，就会导致应用那端出现  General error: 2006 MySQL server has gone away
+
+跟据之前的经验，可以尝试将 HAproxy 与 MySQL 的 timeout 设置为同样的值可以解决这个问题。
+
+以上只是跟据经验得出的结果，有可能和实际情况并不相符，需要具体问题具体分析。
